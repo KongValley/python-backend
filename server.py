@@ -9,7 +9,7 @@ import socket
 import sqlite3
 import tempfile
 import time
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -23,6 +23,7 @@ MAX_ITEM_DEPTH = 64
 ITEM_ROUTE = re.compile(r"/api/items/([1-9][0-9]{0,18})")
 DEFAULT_DB = Path(__file__).resolve().with_name("items.sqlite3")
 DEFAULT_LOG = DEFAULT_DB.parent / "logs" / "server.log"
+DEFAULT_BUSY_TIMEOUT_MS = 2000
 LOG_BACKUPS = 3
 LOG_MAX_BYTES = 1024 * 1024
 LOGGER = logging.getLogger("python_backend")
@@ -80,16 +81,24 @@ def matches_item(data, name, status):
 
 
 class ItemStore:
-    def __init__(self, path):
+    def __init__(self, path, busy_timeout_ms=DEFAULT_BUSY_TIMEOUT_MS):
         self.path = path
+        self.busy_timeout_ms = busy_timeout_ms
 
     @contextmanager
     def connect(self):
-        with closing(sqlite3.connect(str(self.path), timeout=2)) as connection, connection:
+        with closing(sqlite3.connect(str(self.path))) as connection, connection:
+            connection.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms:d}")
             yield connection
 
-    def initialize(self):
-        with self.connect() as connection:
+    def initialize(self, journal_mode=None, *, connection=None):
+        with (self.connect() if connection is None else nullcontext(connection)) as connection:
+            current_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+            if journal_mode is not None and journal_mode != current_mode:
+                pragma = {"wal": "PRAGMA journal_mode=WAL", "delete": "PRAGMA journal_mode=DELETE"}[journal_mode]
+                current_mode = connection.execute(pragma).fetchone()[0]
+                if current_mode != journal_mode:
+                    raise sqlite3.OperationalError(f"Could not set journal mode to {journal_mode}; got {current_mode}")
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS items ("
@@ -100,6 +109,8 @@ class ItemStore:
                 connection.execute("ALTER TABLE items ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0")
             connection.execute("SELECT id, data, updated_at FROM items LIMIT 0")
             connection.execute("CREATE INDEX IF NOT EXISTS items_updated_idx ON items (updated_at, id)")
+            connection.commit()
+            return current_mode
 
     def check(self):
         with self.connect() as connection:
@@ -225,6 +236,43 @@ def copy_snapshot(source, destination):
 
 def log_files_for(path):
     return {path, *(Path(f"{path}.{index}").resolve() for index in range(1, LOG_BACKUPS + 1))}
+
+
+def check_configuration(store, log_path, journal_mode):
+    database = store.path
+    current_mode = "delete"
+    if database.exists():
+        with database.open("r+b"):
+            pass
+        uri = database.resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True)) as connection:
+            connection.execute(f"PRAGMA busy_timeout={store.busy_timeout_ms:d}")
+            validate_snapshot(connection)
+            current_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        print(f"OK database integrity and schema: {database} (current journal mode: {current_mode})")
+    else:
+        print(f"Database will be created on startup: {database}")
+
+    effective_mode = journal_mode or current_mode
+    with tempfile.TemporaryDirectory(prefix=".db-check-", dir=database.parent) as directory:
+        probe = ItemStore(Path(directory) / "probe.sqlite3", store.busy_timeout_ms)
+        probe.initialize(effective_mode)
+        with probe.connect() as connection:
+            connection.execute("INSERT INTO items (data) VALUES (?)", ("{}",))
+    print(f"OK temporary SQLite write: {effective_mode}, lock wait {store.busy_timeout_ms} ms")
+
+    for candidate in log_files_for(log_path):
+        if candidate.exists():
+            with candidate.open("ab"):
+                pass
+    directory = log_path.parent
+    while not directory.exists():
+        directory = directory.parent
+    with tempfile.TemporaryFile(dir=directory) as file:
+        file.write(b"log check")
+        file.flush()
+    print(f"OK log location: {log_path}")
+    print("Self-check passed.")
 
 
 @contextmanager
@@ -565,13 +613,19 @@ def main():
     parser.add_argument("--port", type=int, default=8000, help="listen port (default: 8000)")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB, help="path to the SQLite database")
     parser.add_argument("--log-file", type=Path, default=DEFAULT_LOG, help="path to the rotating server log")
+    parser.add_argument("--journal-mode", choices=("wal", "delete"), help="change the SQLite journal mode on startup")
+    parser.add_argument("--busy-timeout-ms", type=int, default=DEFAULT_BUSY_TIMEOUT_MS,
+                        help="SQLite lock wait in milliseconds for the service (default: 2000)")
     action = parser.add_mutually_exclusive_group()
     action.add_argument("--backup", type=Path, metavar="FILE", help="back up the database to a new file")
     action.add_argument("--restore", type=Path, metavar="FILE", help="restore a snapshot to a new --db file")
     action.add_argument("-i", "--interactive", action="store_true", help="start with an interactive console")
+    action.add_argument("--check", action="store_true", help="check the database and log paths without serving HTTP")
     args = parser.parse_args()
     if not 0 <= args.port <= 65535:
         parser.error("--port must be between 0 and 65535")
+    if not 0 <= args.busy_timeout_ms <= 60000:
+        parser.error("--busy-timeout-ms must be between 0 and 60000")
 
     database = args.db.absolute()
     if args.backup is not None or args.restore is not None:
@@ -593,7 +647,14 @@ def main():
     if database_files & log_files_for(log_path):
         parser.error("database and log file paths must be different")
 
-    store = ItemStore(database)
+    store = ItemStore(database, args.busy_timeout_ms)
+    if args.check:
+        try:
+            check_configuration(store, log_path, args.journal_mode)
+        except (OSError, sqlite3.Error, ValueError) as error:
+            parser.exit(1, f"Self-check failed: {error}\n")
+        return
+
     try:
         server = ApiServer(("127.0.0.1", args.port), store)
     except OSError as error:
@@ -601,16 +662,17 @@ def main():
 
     with server:
         try:
-            store.initialize()
+            with store.connect() as connection:
+                mode = store.initialize(args.journal_mode, connection=connection)
+                with request_logging(log_path, terminal=not args.interactive):
+                    LOGGER.info("SQLite journal mode: %s; lock wait: %d ms", mode, store.busy_timeout_ms)
+                    print(f"Listening on http://127.0.0.1:{server.server_port}", flush=True)
+                    if args.interactive:
+                        serve_interactive(server, log_path)
+                    else:
+                        server.serve_forever()
         except sqlite3.Error as error:
             parser.exit(1, f"Could not initialize database ({args.db}): {error}\n")
-        try:
-            with request_logging(log_path, terminal=not args.interactive):
-                print(f"Listening on http://127.0.0.1:{server.server_port}", flush=True)
-                if args.interactive:
-                    serve_interactive(server, log_path)
-                else:
-                    server.serve_forever()
         except OSError as error:
             parser.exit(1, f"Could not run the server: {error}\n")
         except KeyboardInterrupt:

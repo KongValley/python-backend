@@ -18,6 +18,26 @@ py .\server.py
 py .\server.py --port 8080 --db .\my-data.sqlite3
 ```
 
+## 并发与锁等待
+
+可在启动时启用 WAL，让查询在另一个事务写入时继续读取已提交的数据。SQLite 同一时间只能执行一个写事务。锁等待超时后，HTTP 接口返回 `503`。
+
+```powershell
+py .\server.py --journal-mode wal --busy-timeout-ms 5000
+```
+
+`--busy-timeout-ms` 默认 2000 毫秒，范围 0–60000，设为 0 表示遇锁立即返回。新库默认使用 `delete`，已有库默认沿用自身模式。WAL 设置保存在数据库中。需要切回时，先关闭使用该库的服务和工具，再以 `--journal-mode delete` 启动。WAL 数据库应放在本地磁盘，运行期间可能出现 `-wal` 和 `-shm` 文件。
+
+## 自检与回归测试
+
+```powershell
+py .\server.py --check
+py .\server.py --check --db .\my-data.sqlite3 --journal-mode wal --busy-timeout-ms 5000
+py -B -m unittest discover -v
+```
+
+自检会验证已有数据库的完整性和表结构，在同一目录用临时数据库验证所选日志模式和写入，并探测日志位置。自检无需启动 HTTP 服务，数据库内容和模式保持原样，检查失败时返回非零退出码。回归测试使用独立的临时库和本地临时端口，覆盖接口、旧库升级、写锁竞争、WAL 在线备份与恢复、日志轮转和交互退出。
+
 ## 交互控制台
 
 用 `--interactive` 或 `-i` 启动。看到 `backend>` 后可输入命令，HTTP 接口同时接受请求。
